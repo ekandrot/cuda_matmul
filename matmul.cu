@@ -323,7 +323,7 @@ void time_code_from_nvidia_docs(Matrixes &m, int num_loops)
     printf("   %0.3f TFlops per second\n", TFlops / seconds);
 
     // cublaserr(cublasGetMatrix(MATRIX_ROWS, MATRIX_COLS, sizeof(float), m.dc, SQUARE_DIM, m.c, SQUARE_DIM));
-    // validate_math(.mvalidate, m.c);
+    // validate_math(m.mvalidate, m.c);
     // nvidia doc code uses row major, so it isn't valid
     // swapping that into their code makes to take 2x as long, so this is just for timing of their code
     printf("\n");
@@ -363,6 +363,7 @@ __global__ void very_simple_kernel(const float *a, const float *b, float *c)
     c[row + 4096*col] = sum;
 }
 
+
 void time_very_simple_kernel(Matrixes &m, int num_loops)
 {
     const int TILE_WIDTH{16};
@@ -398,6 +399,71 @@ void time_very_simple_kernel(Matrixes &m, int num_loops)
     cuerr(cudaEventDestroy(stop));
 
 }
+
+//------------------------------------------------------------------------------------------------------------------------
+// time the code from David Kirk's CUDA blog
+
+// From David Kirk - though it is in C format row-major, not Fortran col-major
+__global__ void MatrixMulKernel(const float* d_M, const float* d_N, float* d_P, int Width) {
+    const int TILE_WIDTH{16};
+    __shared__ float Mds[TILE_WIDTH][TILE_WIDTH];
+    __shared__ float Nds[TILE_WIDTH][TILE_WIDTH];
+
+    int bx = blockIdx.x; int by = blockIdx.y;
+    int tx = threadIdx.x; int ty = threadIdx.y;
+
+    // Identify the row and column of the d_P element to work on
+    int Row = by * TILE_WIDTH + ty;
+    int Col = bx * TILE_WIDTH + tx;
+
+    float Pvalue = 0;
+    // Loop over the d_M and d_N tiles required to compute d_P element
+    for (int m = 0; m < Width/TILE_WIDTH; ++m) {
+    // Coolaborative loading of d_M and d_N tiles into shared memory
+        Mds[ty][tx] = d_M[Row*Width + m*TILE_WIDTH + tx];
+        Nds[ty][tx] = d_N[(m*TILE_WIDTH + ty)*Width + Col];
+        __syncthreads();
+        for (int k = 0; k < TILE_WIDTH; ++k) {
+            Pvalue += Mds[ty][k] * Nds[k][tx];
+        }
+        __syncthreads();
+    }
+    d_P[Row*Width + Col] = Pvalue;
+}
+
+void time_code_from_David_Kirk(Matrixes &m, int num_loops)
+{
+    const int TILE_WIDTH{16};
+    dim3 blocks(4096/TILE_WIDTH, 4096/TILE_WIDTH);
+    dim3 threads(TILE_WIDTH, TILE_WIDTH);
+
+    // reset dc to default, so we know we've written to each cell, not using ones from previous kernels
+    cublaserr(cublasSetMatrix(MATRIX_ROWS, MATRIX_COLS, sizeof(float), m.default_c, MATRIX_ROWS, m.dc, MATRIX_COLS));
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+    for (int i=0; i<num_loops; ++i) {
+        MatrixMulKernel<<<blocks, threads>>>(m.da, m.db, m.dc, 4096);
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float milliseconds{0};
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    milliseconds /= num_loops;
+    printf("David Kirk's simple algo Compute time taken:  %0.3f ms\n", milliseconds);
+    float seconds = milliseconds / 1000;
+    printf("   %0.3f TFlops per second\n", TFlops / seconds);
+
+    // this kernel uses row major, so it fail validation
+    // cublaserr(cublasGetMatrix(MATRIX_ROWS, MATRIX_COLS, sizeof(float), m.dc, SQUARE_DIM, m.c, SQUARE_DIM));
+    // validate_math(m.mvalidate, m.c);
+    printf("\n");
+}
+
 
 
 //------------------------------------------------------------------------------------------------------------------------
@@ -762,36 +828,6 @@ __global__ void real_kernel8x8(const float *A, const float *B, float *C) {
 
 //------------------------------------------------------------------------------------------------------------------------
 
-#define TILE_WIDTH 16
-// From David Kirk - though it is in C format row-major, not Fortran col-major
-__global__ void MatrixMulKernel(const float* d_M, const float* d_N, float* d_P, int Width) {
-    __shared__ float Mds[TILE_WIDTH][TILE_WIDTH];
-    __shared__ float Nds[TILE_WIDTH][TILE_WIDTH];
-
-    int bx = blockIdx.x; int by = blockIdx.y;
-    int tx = threadIdx.x; int ty = threadIdx.y;
-
-    // Identify the row and column of the d_P element to work on
-    int Row = by * TILE_WIDTH + ty;
-    int Col = bx * TILE_WIDTH + tx;
-
-    float Pvalue = 0;
-    // Loop over the d_M and d_N tiles required to compute d_P element
-    for (int m = 0; m < Width/TILE_WIDTH; ++m) {
-    // Coolaborative loading of d_M and d_N tiles into shared memory
-        Mds[ty][tx] = d_M[Row*Width + m*TILE_WIDTH + tx];
-        Nds[ty][tx] = d_N[(m*TILE_WIDTH + ty)*Width + Col];
-        __syncthreads();
-        for (int k = 0; k < TILE_WIDTH; ++k) {
-            Pvalue += Mds[ty][k] * Nds[k][tx];
-        }
-        __syncthreads();
-    }
-    d_P[Row*Width + Col] = Pvalue;
-}
-
-//------------------------------------------------------------------------------------------------------------------------
-
 void validate_math(const float *validate, const float *c)
 {
     int incorrect=0;
@@ -914,6 +950,8 @@ int main()
 
     time_very_simple_kernel(m, 10);
 
+    time_code_from_David_Kirk(m, 10);
+
 #if 0
     dim3 r_blocks8x8(32,32);
     dim3 r_threads8x8(16,16);
@@ -962,30 +1000,6 @@ int main()
     cublaserr(cublasSetMatrix(4096, 4096, sizeof(float), c, 4096, dc, 4096));
     printf("\n");
 
-
-    // time Kirk's algo
-    dim3 blocks16x16(4096/TILE_WIDTH, 4096/TILE_WIDTH);
-    dim3 threads16x16(TILE_WIDTH,TILE_WIDTH);
-    cublaserr(cublasSetMatrix(4096, 4096, sizeof(float), c, 4096, dc, 4096));
-
-    cudaEventRecord(start);
-    //MatrixMulKernel<<<blocks16x16,threads16x16>>>(da, db, dc, 4096);
-    kernel_1_2T<<<blocks16x16,threads16x16>>>(da, db, dc);
-    cudaEventRecord(stop);
-
-    cudaEventSynchronize(stop);
-    milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    printf("David Kirk's simple algo Compute time taken:  %0.3f ms\n", milliseconds);
-    seconds = milliseconds / 1000;
-    printf("   %0.3f TFlops\n", 2.0*4096*4096*4096/seconds/1e12);
-
-    cublaserr(cublasGetMatrix(4096, 4096, sizeof(float), dc, 4096, c, 4096));
-    validate_math(validate, c);
-    cublaserr(cublasSetMatrix(4096, 4096, sizeof(float), c, 4096, dc, 4096));
-    printf("\n");
-
-    
 
 
     dim3 blocks(16,128);
