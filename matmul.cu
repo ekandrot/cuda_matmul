@@ -10,11 +10,33 @@ using namespace cooperative_groups;
 #include <chrono>
 using namespace std::chrono;
 
+//------------------------------------------------------------------------------------------------------------------------
 
-#define LOOPAGE 100
+const int SQUARE_DIM{4096};
+const int MATRIX_ROWS{SQUARE_DIM};
+const int MATRIX_COLS{SQUARE_DIM};
+const int MATRIX_SIZE_BYTES = sizeof(float) * MATRIX_ROWS * MATRIX_COLS;
 
+const int LOOPAGE{100};
 
-static cublasStatus_t _cublaserr(cublasStatus_t err, const char*fname, int line_num) {
+float ops_per_fma{2};
+float Flops{ops_per_fma * MATRIX_ROWS * MATRIX_COLS * SQUARE_DIM};
+float TFlops{Flops / 1e12f};
+
+struct Matrixes {
+    // CPU memory
+    float *a, *b, *c, *validate;
+
+    // device memory
+    float *da, *db, *dc, *dvalidate;
+};
+
+void validate_math(const float *validate, const float *c);
+
+//------------------------------------------------------------------------------------------------------------------------
+
+static cublasStatus_t _cublaserr(cublasStatus_t err, const char*fname, int line_num)
+{
     const char* dummyStr = "unknown cublas error";
     if (err != CUBLAS_STATUS_SUCCESS) {
         printf("*** cublas error %d at line %d in %s:  %s\n", err, line_num, fname, dummyStr);
@@ -23,7 +45,8 @@ static cublasStatus_t _cublaserr(cublasStatus_t err, const char*fname, int line_
     return err;
 }
 
-static cudaError_t _cuerr(cudaError_t err, const char*fname, int line_num) {
+static cudaError_t _cuerr(cudaError_t err, const char*fname, int line_num)
+{
     if (err != cudaSuccess) {
         printf("*** cuda error %d at line %d in %s:  %s\n", err, line_num, fname, cudaGetErrorString(err));
     }
@@ -34,8 +57,10 @@ static cudaError_t _cuerr(cudaError_t err, const char*fname, int line_num) {
 #define cublaserr(err) _cublaserr(err, __FILE__, __LINE__)
 #define cuerr(err) _cuerr(err, __FILE__, __LINE__)
 
+//------------------------------------------------------------------------------------------------------------------------
 
-void print_cublas_version(cublasHandle_t cublas_handle) {
+void print_cublas_version(cublasHandle_t cublas_handle)
+{
     int version;
     cublaserr(cublasGetVersion(cublas_handle, &version));
     printf("cublas version:  %d\n", version);
@@ -47,40 +72,143 @@ void print_cublas_version(cublasHandle_t cublas_handle) {
     printf("  Minor version:  %d", value);
     cublaserr(cublasGetProperty(PATCH_LEVEL, &value));
     printf("  Patch level:  %d\n", value);
-
 }
 
-__device__ int sumReduction(thread_group g, float *x, int val) 
-{ 
-    // rank of this thread in the group 
-    const int lane = g.thread_rank(); 
+//------------------------------------------------------------------------------------------------------------------------
+//------------------------------------------------------------------------------------------------------------------------
 
-    // for each iteration of this loop, the number of threads active in the
-    // reduction, i, is halved, and each active thread (with index [lane])
-    // performs a single summation of it's own value with that
-    // of a "partner" (with index [lane+i]). 
-    for (int i = g.size()/2; i > 0; i /= 2) { 
-        // store value for this thread in temporary array
-        x[lane] = val;
-        // synchronize all threads in group
-        g.sync();
-        if (lane<i) {
-            // active threads perform summation of their value with
-            // their partner's value
-            val += x[lane + i];
+//
+// based on real_kernel8x8 - it is that kernel, minus all of the #if'ed out stuff that was used along the way to write that kernel
+//
+
+__launch_bounds__(256, 2)
+__global__ void my_best_kernel(const float *A, const float *B, float *C)
+{
+    const thread_block g = this_thread_block();
+    const int tr = g.thread_index().x;      // 0..15
+    const int tc = g.thread_index().y;      // 0..15
+    const int gr = g.group_index().x * 128;       // 0..31  * 128
+    const int gc = g.group_index().y * 128;       // 0..31  * 128
+
+    // [c][r] for the indexes
+    __shared__ float buffer_A[32][128];
+    __shared__ float buffer_B[128][32];
+
+    float sum[8][8]={};
+
+    const int index = g.thread_rank();  // 0..255
+    const int index127 = index & 127;
+    const int index_div_128 = index / 128;
+    const int index31 = index & 31;
+    const int index_div_32 = index / 32;
+
+    // this is the inner loop, which is the 32 wide read
+    #pragma unroll
+    for (int loop=0; loop<4096; loop+=32) {
+        // use the rank of the thread to load our two caches, linearly
+        for (int i=0; i<32; i+=2) {
+            buffer_A[i + index_div_128][index127] = A[(i + index_div_128 + loop)*4096 + gr + index127];
         }
-        // synchronize all threads in group
+        for (int i=0; i<128; i+=8) {
+            buffer_B[i + index_div_32][index31] = B[(i + index_div_32 + gc)*4096 + loop + index31];
+        }
+        g.sync();
+
+        // 32 for the inner 32 wide read
+        for (int j=0; j<32; ++j) {
+            // 16 groups of 8 = 128
+            float row[8], col[8];
+            for (int i=0; i<8; ++i) {
+                row[i] = buffer_A[j][i*16 + tr];
+                col[i] = buffer_B[i*16 + tc][j];
+            }
+
+            for (int c=0; c<8; ++c) {
+                for (int r=0; r<8; ++r) {
+                    sum[r][c] += row[r] * col[c];       // 1)  was sum[c][r] - swapping rc at here and 2, seems to be faster
+                }
+            }
+        }
         g.sync();
     }
 
-    // master thread in group returns result, and others return -1.
-    if (lane==0)
-        return val;
-    else
-        return -1;
+    for (int c=0; c<8; ++c) {
+        for (int r=0; r<8; ++r) {
+            C[(gc + tc + c*16) * 4096 + (gr + tr + r*16)] = sum[r][c];  // 2) was sum[c][r] - swapping rc at here and 1, seems to be faster
+        }
+    }
 }
 
 
+void time_my_best_kernel(Matrixes &m)
+{
+    dim3 blocks(32,32);
+    dim3 threads(16,16);
+
+    // time my_best_kernel - currently based on real_kernel8x8
+
+    // reset dc to default, so we know we've written to each cell, not using ones from previous kernels
+    cublaserr(cublasSetMatrix(MATRIX_ROWS, MATRIX_COLS, sizeof(float), m.c, MATRIX_ROWS, m.dc, MATRIX_COLS));
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+    for (int i=0; i<LOOPAGE; ++i) {
+        my_best_kernel<<<blocks, threads>>>(m.da, m.db, m.dc);
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float milliseconds{0};
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    milliseconds /= LOOPAGE;
+    printf("my_best_kernel Compute time taken:  %0.3f ms\n", milliseconds);
+    float seconds = milliseconds / 1000;
+    printf("   %0.3f TFlops per second\n", TFlops / seconds);
+
+    cublaserr(cublasGetMatrix(4096, 4096, sizeof(float), m.dc, 4096, m.c, 4096));
+    validate_math(m.validate, m.c);
+    printf("\n");
+
+    cuerr(cudaEventDestroy(start));
+    cuerr(cudaEventDestroy(stop));
+}
+
+//------------------------------------------------------------------------------------------------------------------------
+
+// __device__ int sumReduction(thread_group g, float *x, int val) 
+// { 
+//     // rank of this thread in the group 
+//     const int lane = g.thread_rank(); 
+
+//     // for each iteration of this loop, the number of threads active in the
+//     // reduction, i, is halved, and each active thread (with index [lane])
+//     // performs a single summation of it's own value with that
+//     // of a "partner" (with index [lane+i]). 
+//     for (int i = g.size()/2; i > 0; i /= 2) { 
+//         // store value for this thread in temporary array
+//         x[lane] = val;
+//         // synchronize all threads in group
+//         g.sync();
+//         if (lane<i) {
+//             // active threads perform summation of their value with
+//             // their partner's value
+//             val += x[lane + i];
+//         }
+//         // synchronize all threads in group
+//         g.sync();
+//     }
+
+//     // master thread in group returns result, and others return -1.
+//     if (lane==0)
+//         return val;
+//     else
+//         return -1;
+// }
+
+//------------------------------------------------------------------------------------------------------------------------
 
 #define MAX_THREADS_PER_BLOCK 256
 #define MIN_BLOCKS_PER_MP     1
@@ -133,8 +261,7 @@ __global__ void kernel_32(const float *a, const float *b, float *c) {
     }
 }
 
-
-
+//------------------------------------------------------------------------------------------------------------------------
 
 // dim3 blocks(16,128);
 // dim3 threads(256);
@@ -185,6 +312,7 @@ __global__ void kernel_53T_old(const float *a, const float *b, float *c) {
     }
 }
 
+//------------------------------------------------------------------------------------------------------------------------
 
 // dim3 blocks(16,128);
 // dim3 threads(256);
@@ -255,6 +383,7 @@ __global__ void kernel_53T(const float *a, const float *b, float *c) {
     }
 }
 
+//------------------------------------------------------------------------------------------------------------------------
 
 __global__ void kernel8x8(const float *A, const float *B, float *C) {
     const thread_block g = this_thread_block();
@@ -323,6 +452,7 @@ __global__ void kernel8x8(const float *A, const float *B, float *C) {
     }
 }
 
+//------------------------------------------------------------------------------------------------------------------------
 
 // each thread owns 8x8 of C, which gives 8x2 reads and 64 fmas
 // called with 256 threads, t(16,16) to leverage shared memory and 32 wide reads
@@ -437,67 +567,10 @@ __global__ void real_kernel8x8(const float *A, const float *B, float *C) {
 }
 
 
-//
-// based on real_kernel8x8 - it is the above code, minus all of the #if'ed out stuff, that was used along the way to write that kernel
-//
+//------------------------------------------------------------------------------------------------------------------------
 
-__launch_bounds__(256, 2)
-__global__ void my_best_kernel(const float *A, const float *B, float *C) {
-    const thread_block g = this_thread_block();
-    const int tr = g.thread_index().x;      // 0..15
-    const int tc = g.thread_index().y;      // 0..15
-    const int gr = g.group_index().x * 128;       // 0..31  * 128
-    const int gc = g.group_index().y * 128;       // 0..31  * 128
 
-    // [c][r] for the indexes
-    __shared__ float buffer_A[32][128];
-    __shared__ float buffer_B[128][32];
-
-    float sum[8][8]={};
-
-    const int index = g.thread_rank();  // 0..255
-    const int index127 = index & 127;
-    const int index_div_128 = index / 128;
-    const int index31 = index & 31;
-    const int index_div_32 = index / 32;
-
-    // this is the inner loop, which is the 32 wide read
-    #pragma unroll
-    for (int loop=0; loop<4096; loop+=32) {
-        // use the rank of the thread to load our two caches, linearly
-        for (int i=0; i<32; i+=2) {
-            buffer_A[i + index_div_128][index127] = A[(i + index_div_128 + loop)*4096 + gr + index127];
-        }
-        for (int i=0; i<128; i+=8) {
-            buffer_B[i + index_div_32][index31] = B[(i + index_div_32 + gc)*4096 + loop + index31];
-        }
-        g.sync();
-
-        // 32 for the inner 32 wide read
-        for (int j=0; j<32; ++j) {
-            // 16 groups of 8 = 128
-            float row[8], col[8];
-            for (int i=0; i<8; ++i) {
-                row[i] = buffer_A[j][i*16 + tr];
-                col[i] = buffer_B[i*16 + tc][j];
-            }
-
-            for (int c=0; c<8; ++c) {
-                for (int r=0; r<8; ++r) {
-                    sum[r][c] += row[r] * col[c];       // 1)  was sum[c][r] - swapping rc at here and 2, seems to be faster
-                }
-            }
-        }
-        g.sync();
-    }
-
-    for (int c=0; c<8; ++c) {
-        for (int r=0; r<8; ++r) {
-            C[(gc + tc + c*16) * 4096 + (gr + tr + r*16)] = sum[r][c];  // 2) was sum[c][r] - swapping rc at here and 1, seems to be faster
-        }
-    }
-}
-
+//------------------------------------------------------------------------------------------------------------------------
 
 #define TILE_WIDTH 16
 // From David Kirk - though it is in C format row-major, not Fortran col-major
@@ -527,6 +600,7 @@ __global__ void MatrixMulKernel(const float* d_M, const float* d_N, float* d_P, 
     d_P[Row*Width + Col] = Pvalue;
 }
 
+//------------------------------------------------------------------------------------------------------------------------
 
 // dim3 blocks(256,256);
 // dim3 threads(16,16);
@@ -560,7 +634,7 @@ __global__ void kernel_1_2T(const float *a, const float *b, float *c) {
 }
 
 
-//----------------------------------------------------------------------------------------------------
+//------------------------------------------------------------------------------------------------------------------------
 // code from nvidia docs
 
 
@@ -687,13 +761,10 @@ void MatMul(float *A, float *B, float *C)
     SetElement(Csub, row, col, Cvalue);
 }
 
-//----------------------------------------------------------------------------------------------------
+//------------------------------------------------------------------------------------------------------------------------
 
-
-
-
-
-void validate_math(const float *validate, const float *c) {
+void validate_math(const float *validate, const float *c)
+{
     int incorrect=0;
     for (int i=0; i<4096*4096; ++i) {
         if (c[i] != c[i] || abs(validate[i] - c[i]) > 0.01) {
@@ -706,144 +777,106 @@ void validate_math(const float *validate, const float *c) {
     printf("incorrect values %d\n", incorrect);
 }
 
-
-#if 0
-__global__ void one_fma(float *f, long long int *cycles) {
-    float _f = *f;
-    volatile __shared__ float s_f;
-    __syncthreads();
-    long long int start = clock64();
-    #pragma unroll
-    for (int i=0; i<1000000; ++i) {
-        // _f += _f * _f;
-        _f = s_f;
-        _f += _f * _f;
-        _f += _f * _f;
-        _f += _f * _f;
-        _f += _f * _f;
-        _f += _f * _f;
-        _f += _f * _f;
-        _f += _f * _f;
-        _f += _f * _f;
-        s_f = _f;
-    }
-    long long int end = clock64();
-    *cycles = end - start;
-    *f = s_f;
-}
-
-void time_one_fma() {
-    long long int *cycles;
-    cudaMallocManaged(&cycles, sizeof(long long int));
-    float *f;
-    cudaMallocManaged(&f, sizeof(float)); 
-    *f = 1.0f;
-    one_fma<<<28*16,128>>>(f,cycles);
-    cudaDeviceSynchronize();
-    printf("cycles per op = %lf\n", *cycles/(double)1e6);
-}
-#endif
-
-int main() {
-    // time_one_fma();
-
-    cudaDeviceProp deviceProp;
-    cudaGetDeviceProperties(&deviceProp, 0); // 0-th device
-    printf("number of SMs:  %d\n", deviceProp.multiProcessorCount);
-    
+// m.validate is filled in here, which will be used for validating our kernels
+// we are assuming cublasSgemm returns the golden-master-values
+void create_and_time_validation(Matrixes &m)
+{
+    cublasHandle_t cublas_handle;
+    cublaserr(cublasCreate(&cublas_handle));
+    print_cublas_version(cublas_handle);
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
+    const float alpha{1};
+    const float beta{0};
+    cudaEventRecord(start);
+    for (int i=0; i<LOOPAGE; ++i) {
+        cublaserr(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, MATRIX_ROWS, MATRIX_COLS, SQUARE_DIM,
+            &alpha,
+            m.da, MATRIX_ROWS,
+            m.db, MATRIX_ROWS,
+            &beta,
+            m.dvalidate, MATRIX_ROWS ));
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
 
-    cublasHandle_t cublas_handle;
+    float milliseconds{};
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    milliseconds /= LOOPAGE;
+    printf("cublas Compute time taken:  %0.3f ms\n", milliseconds);
+    float seconds = milliseconds / 1000;
+    printf("   %0.3f TFlops per second\n", TFlops / seconds);
+    cublaserr(cublasGetMatrix(MATRIX_ROWS, MATRIX_COLS, sizeof(float), m.dvalidate, 4096, m.validate, 4096));
+    printf("\n");
 
-    cublaserr(cublasCreate(&cublas_handle));
+    cuerr(cudaEventDestroy(start));
+    cuerr(cudaEventDestroy(stop));
+    cublaserr(cublasDestroy(cublas_handle));
+}
 
-    print_cublas_version(cublas_handle);
+//------------------------------------------------------------------------------------------------------------------------
 
-    const int MATRIX_SIZE = sizeof(float)*4096*4096;
-    float *a, *b, *c, *validate;
-    a = (float*)malloc(MATRIX_SIZE);
-    b = (float*)malloc(MATRIX_SIZE);
-    c = (float*)malloc(MATRIX_SIZE);
-    validate = (float*)malloc(MATRIX_SIZE);
+void create_matrix_data(const int MATRIX_ROWS, const int MATRIX_COLS, Matrixes &m)
+{
+    m.a = (float*)malloc(MATRIX_SIZE_BYTES);
+    m.b = (float*)malloc(MATRIX_SIZE_BYTES);
+    m.c = (float*)malloc(MATRIX_SIZE_BYTES);
+    m.validate = (float*)malloc(MATRIX_SIZE_BYTES);
     for (int r=0; r<4096; ++r) {
         float v = std::rand();
         for (int col=0; col<4096; ++col) {
             int i = 4096*r+col;
-            a[i] = std::rand();
-            b[i] = std::rand();
-            c[i] = 1.1;
-            validate[i] = 1e32;
+            m.a[i] = std::rand();
+            m.b[i] = std::rand();
+            m.c[i] = 1.1;
+            m.validate[i] = 1e32;
         }
     }
 
-    float *da, *db, *dc, *dvalidate;
-    cuerr(cudaMalloc(&da, MATRIX_SIZE));
-    cuerr(cudaMalloc(&db, MATRIX_SIZE));
-    cuerr(cudaMalloc(&dc, MATRIX_SIZE));
-    cuerr(cudaMalloc(&dvalidate, MATRIX_SIZE));
+    cuerr(cudaMalloc(&m.da, MATRIX_SIZE_BYTES));
+    cuerr(cudaMalloc(&m.db, MATRIX_SIZE_BYTES));
+    cuerr(cudaMalloc(&m.dc, MATRIX_SIZE_BYTES));
+    cuerr(cudaMalloc(&m.dvalidate, MATRIX_SIZE_BYTES));
 
-    cudaEventRecord(start);
-    cublaserr(cublasSetMatrix(4096, 4096, sizeof(float), a, 4096, da, 4096));
-    cublaserr(cublasSetMatrix(4096, 4096, sizeof(float), b, 4096, db, 4096));
-    cublaserr(cublasSetMatrix(4096, 4096, sizeof(float), c, 4096, dc, 4096));
-    cublaserr(cublasSetMatrix(4096, 4096, sizeof(float), c, 4096, dvalidate, 4096));
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    float seconds = milliseconds / 1000;
-    // printf("Memcpy time taken:  %0.3f ms\n", milliseconds);
-    // printf("   %0.3f GB/sec\n", sizeof(float)*4096.0*4096*4/seconds/1e9);
+    cublaserr(cublasSetMatrix(MATRIX_ROWS, MATRIX_COLS, sizeof(float), m.a, MATRIX_ROWS, m.da, MATRIX_COLS));
+    cublaserr(cublasSetMatrix(MATRIX_ROWS, MATRIX_COLS, sizeof(float), m.b, MATRIX_ROWS, m.db, MATRIX_COLS));
+    cublaserr(cublasSetMatrix(MATRIX_ROWS, MATRIX_COLS, sizeof(float), m.c, MATRIX_ROWS, m.dc, MATRIX_COLS));
+    cublaserr(cublasSetMatrix(MATRIX_ROWS, MATRIX_COLS, sizeof(float), m.c, MATRIX_ROWS, m.dvalidate, MATRIX_COLS));
+}
 
-    const float alpha = 1.0f;
-    const float beta = 0;
-    cudaEventRecord(start);
-    for (int i=0; i<LOOPAGE; ++i) {
-        cublaserr(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, 4096, 4096, 4096,
-            &alpha,
-            da, 4096,
-            db, 4096,
-            &beta,
-            dvalidate, 4096 ));
-    }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    milliseconds /= LOOPAGE;
-    printf("cublas Compute time taken:  %0.3f ms\n", milliseconds);
-    seconds = milliseconds / 1000;
-    printf("   %0.3f TFlops\n", 2.0*4096*4096*4096/seconds/1e12);
-    cublaserr(cublasGetMatrix(4096, 4096, sizeof(float), dvalidate, 4096, validate, 4096));
-    printf("\n");
+void free_matrixes(Matrixes &m)
+{
+    cuerr(cudaFree(m.da));
+    cuerr(cudaFree(m.db));
+    cuerr(cudaFree(m.dc));
+    cuerr(cudaFree(m.dvalidate));
 
+    free(m.a);
+    free(m.b);
+    free(m.c);
+    free(m.validate);
+}
 
-    dim3 my_best_blocks8x8(32,32);
-    dim3 my_best_threads8x8(16,16);
+//------------------------------------------------------------------------------------------------------------------------
 
-    // time my_best_kernel - currently based on real_kernel8x8
-    cudaEventRecord(start);
-    for (int i=0; i<LOOPAGE; ++i) {
-        my_best_kernel<<<my_best_blocks8x8,my_best_threads8x8>>>(da, db, dc);
-    }
-    cudaEventRecord(stop);
+int main()
+{
+    cudaDeviceProp deviceProp;
+    cudaGetDeviceProperties(&deviceProp, 0); // 0-th device
+    printf("number of SMs:  %d\n", deviceProp.multiProcessorCount);
+    
 
-    cudaEventSynchronize(stop);
-    milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    milliseconds /= LOOPAGE;
-    printf("my_best_kernel Compute time taken:  %0.3f ms\n", milliseconds);
-    seconds = milliseconds / 1000;
-    printf("   %0.3f TFlops\n", 2.0*4096*4096*4096/seconds/1e12);
+    Matrixes m;
 
-    cublaserr(cublasGetMatrix(4096, 4096, sizeof(float), dc, 4096, c, 4096));
-    validate_math(validate, c);
-    cublaserr(cublasSetMatrix(4096, 4096, sizeof(float), c, 4096, dc, 4096));
-    printf("\n");
+    create_matrix_data(MATRIX_ROWS, MATRIX_COLS, m);
+
+    // needed for m.validate - which is used to verify our kernel results
+    create_and_time_validation(m);
+
+    time_my_best_kernel(m);
 
 
 #if 0
@@ -1009,20 +1042,6 @@ int main() {
     printf("   %0.3f GFlops\n", 2.0*SIZE*SIZE*SIZE/seconds/1e9);
 #endif
 
-    cuerr(cudaEventDestroy(start));
-    cuerr(cudaEventDestroy(stop));
-
-    cuerr(cudaFree(dvalidate));
-    cuerr(cudaFree(da));
-    cuerr(cudaFree(db));
-    cuerr(cudaFree(dc));
-
-
-    free(a);
-    free(b);
-    free(c);
-    free(validate);
-
-    cublaserr(cublasDestroy(cublas_handle));
+    free_matrixes(m);
     return 0;
 }
