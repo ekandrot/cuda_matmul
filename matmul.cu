@@ -25,7 +25,7 @@ float TFlops{Flops / 1e12f};
 
 struct Matrixes {
     // CPU memory
-    float *a, *b, *c, *validate;
+    float *a, *b, *c, *validate, *default_c;
 
     // device memory
     float *da, *db, *dc, *dvalidate;
@@ -140,7 +140,7 @@ __global__ void my_best_kernel(const float *A, const float *B, float *C)
 }
 
 
-void time_my_best_kernel(Matrixes &m)
+void time_my_best_kernel(Matrixes &m, int num_loops)
 {
     dim3 blocks(32,32);
     dim3 threads(16,16);
@@ -148,14 +148,14 @@ void time_my_best_kernel(Matrixes &m)
     // time my_best_kernel - currently based on real_kernel8x8
 
     // reset dc to default, so we know we've written to each cell, not using ones from previous kernels
-    cublaserr(cublasSetMatrix(MATRIX_ROWS, MATRIX_COLS, sizeof(float), m.c, MATRIX_ROWS, m.dc, MATRIX_COLS));
+    cublaserr(cublasSetMatrix(MATRIX_ROWS, MATRIX_COLS, sizeof(float), m.default_c, MATRIX_ROWS, m.dc, MATRIX_COLS));
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
     cudaEventRecord(start);
-    for (int i=0; i<LOOPAGE; ++i) {
+    for (int i=0; i<num_loops; ++i) {
         my_best_kernel<<<blocks, threads>>>(m.da, m.db, m.dc);
     }
     cudaEventRecord(stop);
@@ -163,7 +163,7 @@ void time_my_best_kernel(Matrixes &m)
 
     float milliseconds{0};
     cudaEventElapsedTime(&milliseconds, start, stop);
-    milliseconds /= LOOPAGE;
+    milliseconds /= num_loops;
     printf("my_best_kernel Compute time taken:  %0.3f ms\n", milliseconds);
     float seconds = milliseconds / 1000;
     printf("   %0.3f TFlops per second\n", TFlops / seconds);
@@ -174,6 +174,160 @@ void time_my_best_kernel(Matrixes &m)
 
     cuerr(cudaEventDestroy(start));
     cuerr(cudaEventDestroy(stop));
+}
+
+//------------------------------------------------------------------------------------------------------------------------
+// code from nvidia docs
+
+// Thread block size
+#define BLOCK_SIZE 16
+
+// Matrices are stored in row-major order:
+// M(row, col) = *(M.elements + row * M.stride + col)
+typedef struct {
+    int width;
+    int height;
+    int stride; 
+    float* elements;
+} Matrix;
+
+// Get a matrix element
+__device__ float GetElement(const Matrix A, int row, int col)
+{
+    return A.elements[row * A.stride + col];
+}
+
+// Set a matrix element
+__device__ void SetElement(Matrix A, int row, int col,
+                           float value)
+{
+    A.elements[row * A.stride + col] = value;
+}
+
+// Get the BLOCK_SIZExBLOCK_SIZE sub-matrix Asub of A that is
+// located col sub-matrices to the right and row sub-matrices down
+// from the upper-left corner of A
+ __device__ Matrix GetSubMatrix(Matrix A, int row, int col) 
+{
+    Matrix Asub;
+    Asub.width    = BLOCK_SIZE;
+    Asub.height   = BLOCK_SIZE;
+    Asub.stride   = A.stride;
+    Asub.elements = &A.elements[A.stride * BLOCK_SIZE * row
+                                         + BLOCK_SIZE * col];
+    return Asub;
+}
+
+// Forward declaration of the matrix multiplication kernel
+__global__ void MatMulKernel(const Matrix, const Matrix, Matrix);
+
+// Matrix multiplication - Host code
+// Matrix dimensions are assumed to be multiples of BLOCK_SIZE
+void MatMul(float *A, float *B, float *C)
+{
+    // Load A and B to device memory
+    Matrix d_A;
+    d_A.width = d_A.stride = 4096; d_A.height = 4096;
+    d_A.elements = A;
+
+    Matrix d_B;
+    d_B.width = d_B.stride = 4096; d_B.height = 4096;
+    d_B.elements = B;
+
+    // Allocate C in device memory
+    Matrix d_C;
+    d_C.width = d_C.stride = 4096; d_C.height = 4096;
+    d_C.elements = C;
+
+    // Invoke kernel
+    dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 dimGrid(4096 / dimBlock.x, 4096 / dimBlock.y);
+    MatMulKernel<<<dimGrid, dimBlock>>>(d_A, d_B, d_C);
+}
+
+// Matrix multiplication kernel called by MatMul()
+ __global__ void MatMulKernel(Matrix A, Matrix B, Matrix C)
+{
+    // Block row and column
+    int blockRow = blockIdx.y;
+    int blockCol = blockIdx.x;
+
+    // Each thread block computes one sub-matrix Csub of C
+    Matrix Csub = GetSubMatrix(C, blockRow, blockCol);
+
+    // Each thread computes one element of Csub
+    // by accumulating results into Cvalue
+    float Cvalue = 0;
+
+    // Thread row and column within Csub
+    int row = threadIdx.y;
+    int col = threadIdx.x;
+
+    // Loop over all the sub-matrices of A and B that are
+    // required to compute Csub
+    // Multiply each pair of sub-matrices together
+    // and accumulate the results
+    for (int m = 0; m < (A.width / BLOCK_SIZE); ++m) {
+
+        // Get sub-matrix Asub of A
+        Matrix Asub = GetSubMatrix(A, blockRow, m);
+
+        // Get sub-matrix Bsub of B
+        Matrix Bsub = GetSubMatrix(B, m, blockCol);
+
+        // Shared memory used to store Asub and Bsub respectively
+        __shared__ float As[BLOCK_SIZE][BLOCK_SIZE];
+        __shared__ float Bs[BLOCK_SIZE][BLOCK_SIZE];
+
+        // Load Asub and Bsub from device memory to shared memory
+        // Each thread loads one element of each sub-matrix
+        As[row][col] = GetElement(Asub, row, col);
+        Bs[row][col] = GetElement(Bsub, row, col);
+
+        // Synchronize to make sure the sub-matrices are loaded
+        // before starting the computation
+        __syncthreads();
+        // Multiply Asub and Bsub together
+        for (int e = 0; e < BLOCK_SIZE; ++e)
+            Cvalue += As[row][e] * Bs[e][col];
+
+        // Synchronize to make sure that the preceding
+        // computation is done before loading two new
+        // sub-matrices of A and B in the next iteration
+        __syncthreads();
+    }
+
+    // Write Csub to device memory
+    // Each thread writes one element
+    SetElement(Csub, row, col, Cvalue);
+}
+
+
+void time_code_from_nvidia_docs(Matrixes &m, int num_loops)
+{
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+    for (int i=0; i<num_loops; ++i) {
+        MatMul(m.da, m.db, m.dc);
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float milliseconds{0};
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    milliseconds /= num_loops;
+    printf("NVIDIA docs MatMul Compute time taken:  %0.3f ms\n", milliseconds);
+    float seconds = milliseconds / 1000;
+    printf("   %0.3f TFlops per second\n", TFlops / seconds);
+
+    cublaserr(cublasGetMatrix(4096, 4096, sizeof(float), m.dc, 4096, m.c, 4096));
+    // validate_math(validate, c);
+    // nvidia doc code uses row major, so it isn't valid
+    // swapping that into their code makes to take 2x as long, so this is just for timing of their code
+    printf("\n");
 }
 
 //------------------------------------------------------------------------------------------------------------------------
@@ -633,134 +787,6 @@ __global__ void kernel_1_2T(const float *a, const float *b, float *c) {
     c[row + 4096*col] = sum;
 }
 
-
-//------------------------------------------------------------------------------------------------------------------------
-// code from nvidia docs
-
-
-// Thread block size
-#define BLOCK_SIZE 16
-
-// Matrices are stored in row-major order:
-// M(row, col) = *(M.elements + row * M.stride + col)
-typedef struct {
-    int width;
-    int height;
-    int stride; 
-    float* elements;
-} Matrix;
-
-// Get a matrix element
-__device__ float GetElement(const Matrix A, int row, int col)
-{
-    return A.elements[row * A.stride + col];
-}
-
-// Set a matrix element
-__device__ void SetElement(Matrix A, int row, int col,
-                           float value)
-{
-    A.elements[row * A.stride + col] = value;
-}
-
-// Get the BLOCK_SIZExBLOCK_SIZE sub-matrix Asub of A that is
-// located col sub-matrices to the right and row sub-matrices down
-// from the upper-left corner of A
- __device__ Matrix GetSubMatrix(Matrix A, int row, int col) 
-{
-    Matrix Asub;
-    Asub.width    = BLOCK_SIZE;
-    Asub.height   = BLOCK_SIZE;
-    Asub.stride   = A.stride;
-    Asub.elements = &A.elements[A.stride * BLOCK_SIZE * row
-                                         + BLOCK_SIZE * col];
-    return Asub;
-}
-
-// Forward declaration of the matrix multiplication kernel
-__global__ void MatMulKernel(const Matrix, const Matrix, Matrix);
-
-// Matrix multiplication - Host code
-// Matrix dimensions are assumed to be multiples of BLOCK_SIZE
-void MatMul(float *A, float *B, float *C)
-{
-    // Load A and B to device memory
-    Matrix d_A;
-    d_A.width = d_A.stride = 4096; d_A.height = 4096;
-    d_A.elements = A;
-
-    Matrix d_B;
-    d_B.width = d_B.stride = 4096; d_B.height = 4096;
-    d_B.elements = B;
-
-    // Allocate C in device memory
-    Matrix d_C;
-    d_C.width = d_C.stride = 4096; d_C.height = 4096;
-    d_C.elements = C;
-
-    // Invoke kernel
-    dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
-    dim3 dimGrid(4096 / dimBlock.x, 4096 / dimBlock.y);
-    MatMulKernel<<<dimGrid, dimBlock>>>(d_A, d_B, d_C);
-}
-
-// Matrix multiplication kernel called by MatMul()
- __global__ void MatMulKernel(Matrix A, Matrix B, Matrix C)
-{
-    // Block row and column
-    int blockRow = blockIdx.y;
-    int blockCol = blockIdx.x;
-
-    // Each thread block computes one sub-matrix Csub of C
-    Matrix Csub = GetSubMatrix(C, blockRow, blockCol);
-
-    // Each thread computes one element of Csub
-    // by accumulating results into Cvalue
-    float Cvalue = 0;
-
-    // Thread row and column within Csub
-    int row = threadIdx.y;
-    int col = threadIdx.x;
-
-    // Loop over all the sub-matrices of A and B that are
-    // required to compute Csub
-    // Multiply each pair of sub-matrices together
-    // and accumulate the results
-    for (int m = 0; m < (A.width / BLOCK_SIZE); ++m) {
-
-        // Get sub-matrix Asub of A
-        Matrix Asub = GetSubMatrix(A, blockRow, m);
-
-        // Get sub-matrix Bsub of B
-        Matrix Bsub = GetSubMatrix(B, m, blockCol);
-
-        // Shared memory used to store Asub and Bsub respectively
-        __shared__ float As[BLOCK_SIZE][BLOCK_SIZE];
-        __shared__ float Bs[BLOCK_SIZE][BLOCK_SIZE];
-
-        // Load Asub and Bsub from device memory to shared memory
-        // Each thread loads one element of each sub-matrix
-        As[row][col] = GetElement(Asub, row, col);
-        Bs[row][col] = GetElement(Bsub, row, col);
-
-        // Synchronize to make sure the sub-matrices are loaded
-        // before starting the computation
-        __syncthreads();
-        // Multiply Asub and Bsub together
-        for (int e = 0; e < BLOCK_SIZE; ++e)
-            Cvalue += As[row][e] * Bs[e][col];
-
-        // Synchronize to make sure that the preceding
-        // computation is done before loading two new
-        // sub-matrices of A and B in the next iteration
-        __syncthreads();
-    }
-
-    // Write Csub to device memory
-    // Each thread writes one element
-    SetElement(Csub, row, col, Cvalue);
-}
-
 //------------------------------------------------------------------------------------------------------------------------
 
 void validate_math(const float *validate, const float *c)
@@ -774,12 +800,12 @@ void validate_math(const float *validate, const float *c)
             }
         }
     }
-    printf("incorrect values %d\n", incorrect);
+    printf("  incorrect values %d\n", incorrect);
 }
 
 // m.validate is filled in here, which will be used for validating our kernels
 // we are assuming cublasSgemm returns the golden-master-values
-void create_and_time_validation(Matrixes &m)
+void create_and_time_validation(Matrixes &m, int num_loops)
 {
     cublasHandle_t cublas_handle;
     cublaserr(cublasCreate(&cublas_handle));
@@ -792,7 +818,7 @@ void create_and_time_validation(Matrixes &m)
     const float alpha{1};
     const float beta{0};
     cudaEventRecord(start);
-    for (int i=0; i<LOOPAGE; ++i) {
+    for (int i=0; i<num_loops; ++i) {
         cublaserr(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, MATRIX_ROWS, MATRIX_COLS, SQUARE_DIM,
             &alpha,
             m.da, MATRIX_ROWS,
@@ -805,7 +831,7 @@ void create_and_time_validation(Matrixes &m)
 
     float milliseconds{};
     cudaEventElapsedTime(&milliseconds, start, stop);
-    milliseconds /= LOOPAGE;
+    milliseconds /= num_loops;
     printf("cublas Compute time taken:  %0.3f ms\n", milliseconds);
     float seconds = milliseconds / 1000;
     printf("   %0.3f TFlops per second\n", TFlops / seconds);
@@ -825,6 +851,8 @@ void create_matrix_data(const int MATRIX_ROWS, const int MATRIX_COLS, Matrixes &
     m.b = (float*)malloc(MATRIX_SIZE_BYTES);
     m.c = (float*)malloc(MATRIX_SIZE_BYTES);
     m.validate = (float*)malloc(MATRIX_SIZE_BYTES);
+    m.default_c = (float*)malloc(MATRIX_SIZE_BYTES);
+    
     for (int r=0; r<4096; ++r) {
         float v = std::rand();
         for (int col=0; col<4096; ++col) {
@@ -832,6 +860,7 @@ void create_matrix_data(const int MATRIX_ROWS, const int MATRIX_COLS, Matrixes &
             m.a[i] = std::rand();
             m.b[i] = std::rand();
             m.c[i] = 1.1;
+            m.default_c[i] = 1.1;
             m.validate[i] = 1e32;
         }
     }
@@ -874,10 +903,11 @@ int main()
     create_matrix_data(MATRIX_ROWS, MATRIX_COLS, m);
 
     // needed for m.validate - which is used to verify our kernel results
-    create_and_time_validation(m);
+    create_and_time_validation(m, LOOPAGE);
 
-    time_my_best_kernel(m);
+    time_my_best_kernel(m, LOOPAGE);
 
+    time_code_from_nvidia_docs(m, 10);
 
 #if 0
     dim3 r_blocks8x8(32,32);
@@ -995,28 +1025,6 @@ int main()
     printf("\n");
 
 
-
-
-    // time MatMul from nvidia docs
-    cublaserr(cublasSetMatrix(4096, 4096, sizeof(float), c, 4096, dc, 4096));
-
-    cudaEventRecord(start);
-    MatMul(da, db, dc);
-    cudaEventRecord(stop);
-
-    cudaEventSynchronize(stop);
-    milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    printf("MatMul Compute time taken:  %0.3f ms\n", milliseconds);
-    seconds = milliseconds / 1000;
-    printf("   %0.3f TFlops\n", 2.0*4096*4096*4096/seconds/1e12);
-
-    cublaserr(cublasGetMatrix(4096, 4096, sizeof(float), dc, 4096, c, 4096));
-    // validate_math(validate, c);
-    // nvidia doc code uses row major, so it isn't valid
-    // swapping that in their code makes to take 2x as long, so this is just for timing of their crappy code
-    cublaserr(cublasSetMatrix(4096, 4096, sizeof(float), c, 4096, dc, 4096));
-    printf("\n");
 
 
 #endif
