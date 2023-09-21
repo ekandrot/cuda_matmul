@@ -80,7 +80,6 @@ void print_cublas_version(cublasHandle_t cublas_handle)
 //
 // based on real_kernel8x8 - it is that kernel, minus all of the #if'ed out stuff that was used along the way to write that kernel
 //
-
 __launch_bounds__(256, 2)
 __global__ void my_best_kernel(const float *A, const float *B, float *C)
 {
@@ -168,7 +167,7 @@ void time_my_best_kernel(Matrixes &m, int num_loops)
     float seconds = milliseconds / 1000;
     printf("   %0.3f TFlops per second\n", TFlops / seconds);
 
-    cublaserr(cublasGetMatrix(4096, 4096, sizeof(float), m.dc, 4096, m.c, 4096));
+    cublaserr(cublasGetMatrix(MATRIX_ROWS, MATRIX_COLS, sizeof(float), m.dc, SQUARE_DIM, m.c, SQUARE_DIM));
     validate_math(m.validate, m.c);
     printf("\n");
 
@@ -323,8 +322,8 @@ void time_code_from_nvidia_docs(Matrixes &m, int num_loops)
     float seconds = milliseconds / 1000;
     printf("   %0.3f TFlops per second\n", TFlops / seconds);
 
-    cublaserr(cublasGetMatrix(4096, 4096, sizeof(float), m.dc, 4096, m.c, 4096));
-    // validate_math(validate, c);
+    // cublaserr(cublasGetMatrix(MATRIX_ROWS, MATRIX_COLS, sizeof(float), m.dc, SQUARE_DIM, m.c, SQUARE_DIM));
+    // validate_math(.mvalidate, m.c);
     // nvidia doc code uses row major, so it isn't valid
     // swapping that into their code makes to take 2x as long, so this is just for timing of their code
     printf("\n");
@@ -332,37 +331,77 @@ void time_code_from_nvidia_docs(Matrixes &m, int num_loops)
 
 //------------------------------------------------------------------------------------------------------------------------
 
-// __device__ int sumReduction(thread_group g, float *x, int val) 
-// { 
-//     // rank of this thread in the group 
-//     const int lane = g.thread_rank(); 
+// dim3 blocks(256,256);
+// dim3 threads(16,16);
+// runs around 1.2 TFlops/s on 4096x4096 * 4096x4096
+__global__ void very_simple_kernel(const float *a, const float *b, float *c)
+{
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int gr = blockIdx.x;
+    int gc = blockIdx.y;
 
-//     // for each iteration of this loop, the number of threads active in the
-//     // reduction, i, is halved, and each active thread (with index [lane])
-//     // performs a single summation of it's own value with that
-//     // of a "partner" (with index [lane+i]). 
-//     for (int i = g.size()/2; i > 0; i /= 2) { 
-//         // store value for this thread in temporary array
-//         x[lane] = val;
-//         // synchronize all threads in group
-//         g.sync();
-//         if (lane<i) {
-//             // active threads perform summation of their value with
-//             // their partner's value
-//             val += x[lane + i];
-//         }
-//         // synchronize all threads in group
-//         g.sync();
-//     }
+    const int col = gc*16+ty;
+    const int row = gr*16+tx;
 
-//     // master thread in group returns result, and others return -1.
-//     if (lane==0)
-//         return val;
-//     else
-//         return -1;
-// }
+    thread_block g = this_thread_block();
+
+    __shared__ float ablk[16][16], bblk[16][16];
+
+    float sum = 0;
+
+    for (int i=0; i<4096; i+=16) {
+        ablk[ty][tx] = a[row+(i+ty)*4096];
+        bblk[ty][tx] = b[col*4096 + (i+tx)];
+        g.sync();
+
+        for (int j=0; j<16; ++j) {
+            sum += ablk[j][tx] * bblk[ty][j];
+        }
+        g.sync();
+    }
+    c[row + 4096*col] = sum;
+}
+
+void time_very_simple_kernel(Matrixes &m, int num_loops)
+{
+    const int TILE_WIDTH{16};
+    dim3 blocks(4096/TILE_WIDTH, 4096/TILE_WIDTH);
+    dim3 threads(TILE_WIDTH, TILE_WIDTH);
+
+    // reset dc to default, so we know we've written to each cell, not using ones from previous kernels
+    cublaserr(cublasSetMatrix(MATRIX_ROWS, MATRIX_COLS, sizeof(float), m.default_c, MATRIX_ROWS, m.dc, MATRIX_COLS));
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+    for (int i=0; i<num_loops; ++i) {
+        very_simple_kernel<<<blocks,threads>>>(m.da, m.db, m.dc);
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float milliseconds{0};
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    milliseconds /= num_loops;
+    printf("very_simple_kernel Compute time taken:  %0.3f ms\n", milliseconds);
+    float seconds = milliseconds / 1000;
+    printf("   %0.3f TFlops per second\n", TFlops / seconds);
+
+    cublaserr(cublasGetMatrix(MATRIX_ROWS, MATRIX_COLS, sizeof(float), m.dc, SQUARE_DIM, m.c, SQUARE_DIM));
+    validate_math(m.validate, m.c);
+    printf("\n");
+
+    cuerr(cudaEventDestroy(start));
+    cuerr(cudaEventDestroy(stop));
+
+}
+
 
 //------------------------------------------------------------------------------------------------------------------------
+
 
 #define MAX_THREADS_PER_BLOCK 256
 #define MIN_BLOCKS_PER_MP     1
@@ -723,9 +762,6 @@ __global__ void real_kernel8x8(const float *A, const float *B, float *C) {
 
 //------------------------------------------------------------------------------------------------------------------------
 
-
-//------------------------------------------------------------------------------------------------------------------------
-
 #define TILE_WIDTH 16
 // From David Kirk - though it is in C format row-major, not Fortran col-major
 __global__ void MatrixMulKernel(const float* d_M, const float* d_N, float* d_P, int Width) {
@@ -752,39 +788,6 @@ __global__ void MatrixMulKernel(const float* d_M, const float* d_N, float* d_P, 
         __syncthreads();
     }
     d_P[Row*Width + Col] = Pvalue;
-}
-
-//------------------------------------------------------------------------------------------------------------------------
-
-// dim3 blocks(256,256);
-// dim3 threads(16,16);
-// runs around 1.2 TFlops/s on 4096x4096 * 4096x4096
-__global__ void kernel_1_2T(const float *a, const float *b, float *c) {
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int gr = blockIdx.x;
-    int gc = blockIdx.y;
-
-    const int col = gc*16+ty;
-    const int row = gr*16+tx;
-
-    thread_block g = this_thread_block();
-
-    __shared__ float ablk[16][16], bblk[16][16];
-
-    float sum = 0;
-
-    for (int i=0; i<4096; i+=16) {
-        ablk[ty][tx] = a[row+(i+ty)*4096];
-        bblk[ty][tx] = b[col*4096 + (i+tx)];
-        g.sync();
-
-        for (int j=0; j<16; ++j) {
-            sum += ablk[j][tx] * bblk[ty][j];
-        }
-        g.sync();
-    }
-    c[row + 4096*col] = sum;
 }
 
 //------------------------------------------------------------------------------------------------------------------------
@@ -835,7 +838,7 @@ void create_and_time_validation(Matrixes &m, int num_loops)
     printf("cublas Compute time taken:  %0.3f ms\n", milliseconds);
     float seconds = milliseconds / 1000;
     printf("   %0.3f TFlops per second\n", TFlops / seconds);
-    cublaserr(cublasGetMatrix(MATRIX_ROWS, MATRIX_COLS, sizeof(float), m.dvalidate, 4096, m.validate, 4096));
+    cublaserr(cublasGetMatrix(MATRIX_ROWS, MATRIX_COLS, sizeof(float), m.dvalidate, SQUARE_DIM, m.validate, SQUARE_DIM));
     printf("\n");
 
     cuerr(cudaEventDestroy(start));
@@ -908,6 +911,8 @@ int main()
     time_my_best_kernel(m, LOOPAGE);
 
     time_code_from_nvidia_docs(m, 10);
+
+    time_very_simple_kernel(m, 10);
 
 #if 0
     dim3 r_blocks8x8(32,32);
